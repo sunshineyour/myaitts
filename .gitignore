@@ -1,0 +1,12 @@
+# 排除其他所有文件
+*
+
+# 只允许以下文件和文件夹
+!examples/
+!public/
+!scripts/
+!src/
+!ecosystem.config.js
+!package.json
+!package-lock.json
+!.gitignore
