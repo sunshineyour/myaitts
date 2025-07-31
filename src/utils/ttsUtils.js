@@ -565,6 +565,82 @@ async function processChunks(chunks, voiceId, modelId, stability, similarity_boo
 }
 
 /**
+ * 【新增】代理健康检查函数
+ * 快速检查代理是否可用，3秒超时，最多2次尝试
+ * @param {string} proxyUrl - 代理URL
+ * @param {object} proxyConfig - 代理配置
+ * @returns {Promise<boolean>} 是否健康
+ */
+async function checkProxyHealth(proxyUrl, proxyConfig) {
+  // 如果未启用健康检查，直接返回true（跳过检查）
+  if (!proxyConfig.TTS_HEALTH_CHECK_ENABLED) {
+    return true;
+  }
+
+  // 根据代理URL类型确定健康检查端点
+  function getHealthEndpoint(url) {
+    if (url.endsWith('amazonaws.com') || url.includes('amazonaws.com/')) {
+      return '/api/v1/health'; // AWS Lambda代理
+    } else {
+      return '/api/health'; // aispeak.top和其他代理
+    }
+  }
+
+  const healthEndpoint = getHealthEndpoint(proxyUrl);
+  const healthUrl = `${proxyUrl}${healthEndpoint}`;
+  const timeout = proxyConfig.TTS_HEALTH_CHECK_TIMEOUT || 3000;
+
+  // 最多2次检查，任意一次成功即可
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      if (proxyConfig.ENABLE_PROXY_DEBUG) {
+        console.log(`[HEALTH-CHECK] Checking proxy health: ${proxyUrl} (attempt ${attempt}/2)`);
+      }
+
+      // 构建请求头，包含认证信息
+      const headers = {};
+      if (proxyConfig.TTS_PROXY_SECRET) {
+        headers['x-proxy-secret'] = proxyConfig.TTS_PROXY_SECRET;
+      }
+
+      const response = await fetch(healthUrl, {
+        method: 'GET',
+        headers: headers,
+        signal: AbortSignal.timeout(timeout)
+      });
+
+      // 只要返回200 OK就认为是健康的
+      if (response.ok) {
+        if (proxyConfig.ENABLE_PROXY_DEBUG) {
+          console.log(`[HEALTH-CHECK] Proxy is healthy: ${proxyUrl}`);
+        }
+        return true;
+      }
+
+      if (proxyConfig.ENABLE_PROXY_DEBUG) {
+        console.log(`[HEALTH-CHECK] Proxy returned ${response.status}: ${proxyUrl}`);
+      }
+
+    } catch (error) {
+      if (proxyConfig.ENABLE_PROXY_DEBUG) {
+        console.log(`[HEALTH-CHECK] Attempt ${attempt} failed for ${proxyUrl}: ${error.message}`);
+      }
+
+      // 第一次失败，继续第二次尝试
+      if (attempt === 1) {
+        continue;
+      }
+    }
+  }
+
+  if (proxyConfig.ENABLE_PROXY_DEBUG) {
+    console.log(`[HEALTH-CHECK] Proxy is unhealthy after 2 attempts: ${proxyUrl}`);
+  }
+
+  return false; // 两次都失败，认为不健康
+}
+
+/**
  * 【新增】智能代理选择器 - 随机轮询 + 故障排除
  * 实现随机化轮询，避免重复选择故障代理，提高成功率
  */
@@ -614,12 +690,32 @@ class ProxySelector {
    * @returns {string|null} 下一个可用的代理URL，如果没有可用代理则返回null
    */
   getNextProxy() {
-    // 跳过已失败的代理，找到下一个可用的
-    while (this.currentIndex < this.shuffledUrls.length) {
-      const url = this.shuffledUrls[this.currentIndex++];
+    // 如果没有代理或所有代理都失败了，直接返回null
+    if (this.shuffledUrls.length === 0 || this.failedUrls.size >= this.shuffledUrls.length) {
+      if (this.enableDebug) {
+        console.log('[PROXY-SELECTOR] No more available proxies');
+      }
+      return null;
+    }
+
+    let attempts = 0;
+    const maxAttempts = this.shuffledUrls.length; // 防止无限循环
+
+    // 循环查找可用代理
+    while (attempts < maxAttempts) {
+      // 如果到达末尾，重置到开头
+      if (this.currentIndex >= this.shuffledUrls.length) {
+        this.currentIndex = 0;
+      }
+
+      const url = this.shuffledUrls[this.currentIndex];
+      const currentIndexForLog = this.currentIndex;
+      this.currentIndex++; // 移动到下一个位置
+      attempts++;
+
       if (!this.failedUrls.has(url)) {
         if (this.enableDebug) {
-          console.log(`[PROXY-SELECTOR] Selected proxy: ${url} (index: ${this.currentIndex - 1})`);
+          console.log(`[PROXY-SELECTOR] Selected proxy: ${url} (index: ${currentIndexForLog})`);
         }
         return url;
       } else {
@@ -629,10 +725,11 @@ class ProxySelector {
       }
     }
 
+    // 所有代理都已失败
     if (this.enableDebug) {
       console.log('[PROXY-SELECTOR] No more available proxies');
     }
-    return null; // 所有代理都失败了或已尝试完
+    return null;
   }
 
   /**
@@ -735,17 +832,57 @@ async function callTtsProxyWithSmartRetry(text, voiceId, modelId, stability, sim
       break;
     }
 
+    // 【新增】健康检查 - 快速验证代理是否可用
+    if (proxyConfig.TTS_HEALTH_CHECK_ENABLED) {
+      const healthCheckStartTime = Date.now();
+      const isHealthy = await checkProxyHealth(proxyUrl, proxyConfig);
+      const healthCheckDuration = Date.now() - healthCheckStartTime;
+
+      if (!isHealthy) {
+        // 健康检查失败，标记为失败并跳过
+        proxySelector.markFailed(proxyUrl);
+
+        contextLogger.logProxy('Proxy health check failed', {
+          attempt,
+          maxRetries,
+          proxyUrl: proxyUrl.replace(/\/\/.*@/, '//***@'),
+          healthCheckDuration: `${healthCheckDuration}ms`,
+          reason: 'health-check-failed',
+          willRetry: attempt < maxRetries && proxySelector.hasAvailableProxy()
+        });
+
+        // 继续尝试下一个代理
+        continue;
+      }
+
+      contextLogger.logProxy('Proxy health check passed', {
+        proxyUrl: proxyUrl.replace(/\/\/.*@/, '//***@'),
+        healthCheckDuration: `${healthCheckDuration}ms`
+      });
+    }
+
     try {
+      // 【新增】计算将要使用的超时时间
+      const willUseHealthyTimeout = proxyConfig.TTS_HEALTH_CHECK_ENABLED;
+      const timeoutMs = willUseHealthyTimeout ?
+        (proxyConfig.TTS_HEALTHY_PROXY_TIMEOUT || 60000) :
+        (proxyConfig.TTS_PROXY_TIMEOUT || 45000);
+
       contextLogger.logProxy('Attempting proxy request', {
         attempt,
         maxRetries,
         proxyUrl: proxyUrl.replace(/\/\/.*@/, '//***@'), // 隐藏认证信息
-        strategy: proxyConfig.TTS_PROXY_SELECTION_STRATEGY
+        strategy: proxyConfig.TTS_PROXY_SELECTION_STRATEGY,
+        healthCheckEnabled: proxyConfig.TTS_HEALTH_CHECK_ENABLED,
+        timeoutMs: `${timeoutMs}ms`,
+        timeoutType: willUseHealthyTimeout ? 'healthy-proxy' : 'standard'
       });
 
       const requestStartTime = Date.now();
+      // 【新增】传递健康检查状态，如果启用了健康检查则认为代理是健康的
+      const isHealthy = proxyConfig.TTS_HEALTH_CHECK_ENABLED;
       const audioBuffer = await callSingleTtsProxy(
-        text, voiceId, modelId, stability, similarity_boost, style, speed, proxyUrl, proxyConfig
+        text, voiceId, modelId, stability, similarity_boost, style, speed, proxyUrl, proxyConfig, isHealthy
       );
 
       const requestDuration = Date.now() - requestStartTime;
@@ -818,9 +955,10 @@ async function callTtsProxyWithSmartRetry(text, voiceId, modelId, stability, sim
  * @param {number} speed - 语速参数
  * @param {string} proxyUrl - 指定的代理URL
  * @param {object} proxyConfig - 代理配置
+ * @param {boolean} isHealthy - 是否已通过健康检查（可选，默认false）
  * @returns {Promise<ArrayBuffer>} 音频数据
  */
-async function callSingleTtsProxy(text, voiceId, modelId, stability, similarity_boost, style, speed, proxyUrl, proxyConfig) {
+async function callSingleTtsProxy(text, voiceId, modelId, stability, similarity_boost, style, speed, proxyUrl, proxyConfig, isHealthy = false) {
   // 构建完整的代理请求URL
   const fullProxyUrl = `${proxyUrl}/api/v1/text-to-speech/${voiceId}`;
 
@@ -855,6 +993,16 @@ async function callSingleTtsProxy(text, voiceId, modelId, stability, similarity_
     voice_settings: voice_settings
   };
 
+  // 【新增】根据健康检查状态选择超时时间
+  let timeoutMs;
+  if (isHealthy && proxyConfig.TTS_HEALTH_CHECK_ENABLED) {
+    // 已通过健康检查的代理使用更长的超时时间
+    timeoutMs = proxyConfig.TTS_HEALTHY_PROXY_TIMEOUT || 60000;
+  } else {
+    // 未通过健康检查或未启用健康检查时使用默认超时
+    timeoutMs = proxyConfig.TTS_PROXY_TIMEOUT || 45000;
+  }
+
   const response = await fetch(fullProxyUrl, {
     method: 'POST',
     headers: {
@@ -863,7 +1011,7 @@ async function callSingleTtsProxy(text, voiceId, modelId, stability, similarity_
       'x-proxy-secret': proxyConfig.TTS_PROXY_SECRET
     },
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(proxyConfig.TTS_PROXY_TIMEOUT || 45000)
+    signal: AbortSignal.timeout(timeoutMs)
   });
 
   if (!response.ok) {
@@ -1692,6 +1840,8 @@ module.exports = {
   ProxySelector,
   callTtsProxyWithSmartRetry,
   callSingleTtsProxy,
+  // 【新增】健康检查函数
+  checkProxyHealth,
   // 【新增】网关集成函数
   generateSpeechWithGateway,
   generateSpeechSmart

@@ -49,7 +49,7 @@ const getTTSProxyConfig = () => {
     // 单一代理URL（向后兼容，从列表中取第一个）
     TTS_PROXY_URL: proxyUrls.length > 0 ? proxyUrls[0] : null,
 
-    TTS_PROXY_SECRET: process.env.TTS_PROXY_SECRET || null, // 代理认证密钥
+    TTS_PROXY_SECRET: process.env.TTS_PROXY_SECRET || process.env.PROXY_SECRET || null, // 代理认证密钥
 
     // 代理策略配置
     TTS_PROXY_MODE: process.env.TTS_PROXY_MODE || 'fallback', // 'direct', 'proxy', 'balanced', 'fallback'
@@ -58,6 +58,11 @@ const getTTSProxyConfig = () => {
 
     // 负载均衡配置（当模式为 'balanced' 时使用）
     TTS_PROXY_BALANCE_RATIO: parseFloat(process.env.TTS_PROXY_BALANCE_RATIO || '0.9'), // 90% 流量走代理
+
+    // 【新增】健康检查配置
+    TTS_HEALTH_CHECK_ENABLED: process.env.TTS_HEALTH_CHECK_ENABLED === 'true', // 是否启用健康检查
+    TTS_HEALTH_CHECK_TIMEOUT: parseInt(process.env.TTS_HEALTH_CHECK_TIMEOUT || '3000'), // 健康检查超时时间（毫秒）
+    TTS_HEALTHY_PROXY_TIMEOUT: parseInt(process.env.TTS_HEALTHY_PROXY_TIMEOUT || '60000'), // 健康代理的请求超时时间（毫秒）
 
     // 故障转移配置
     TTS_FALLBACK_THRESHOLD: parseInt(process.env.TTS_FALLBACK_THRESHOLD || '2'), // 连续失败N次后启用预防性代理
