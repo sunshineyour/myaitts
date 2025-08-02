@@ -46,7 +46,7 @@ module.exports = {
 
       // PM2日志轮转配置
       max_log_size: '50M',        // 单个日志文件最大大小
-      retain_logs: 30,            // 保留的日志文件数量
+      retain_logs: 10,            // 保留的日志文件数量
       
       // 自动重启配置
       autorestart: true,

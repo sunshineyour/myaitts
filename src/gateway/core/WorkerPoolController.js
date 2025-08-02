@@ -105,7 +105,7 @@ class WorkerPoolController extends IProxyProvider {
   }
 
   /**
-   * 验证节点名称格式
+   * 验证节点名称格式 (已移除格式限制)
    * @param {string} nodeName - 节点名称
    * @returns {boolean} 是否为有效的节点名称
    */
@@ -114,10 +114,9 @@ class WorkerPoolController extends IProxyProvider {
       return false;
     }
 
-    // 验证节点名称格式：国家代码-服务商-编号-索引
-    // 例如：jp-awsjp-01-idx-0, us-us-01-0-1-hy2-idx-10
-    const nodeNamePattern = /^[a-z]{2}-[a-z0-9]+-.*-idx-\d+$/i;
-    return nodeNamePattern.test(nodeName);
+    // 移除格式验证，接受所有有效字符串节点名称
+    // 只要是非空字符串即可
+    return true;
   }
 
   /**
@@ -252,47 +251,139 @@ class WorkerPoolController extends IProxyProvider {
   }
 
   /**
+   * 创建健康检查专用的代理配置
+   * @returns {Object} 代理配置对象
+   */
+  createHealthCheckProxyAgent() {
+    const proxyHost = this.config.SINGBOX_PROXY_HOST || '127.0.0.1';
+    const proxyPort = this.config.SINGBOX_PROXY_PORT || 1080;
+
+    try {
+      // 优先使用fetch-socks（支持Node.js fetch）
+      const { socksDispatcher } = require('fetch-socks');
+      return {
+        dispatcher: socksDispatcher({
+          type: 5,
+          host: proxyHost,
+          port: proxyPort
+        })
+      };
+    } catch (fetchSocksError) {
+      // 降级到传统的socks-proxy-agent
+      try {
+        const { SocksProxyAgent } = require('socks-proxy-agent');
+        const proxyUrl = `socks5h://${proxyHost}:${proxyPort}`;
+        return {
+          agent: new SocksProxyAgent(proxyUrl)
+        };
+      } catch (socksError) {
+        this.logger.warn('Failed to create proxy agent for health check, using direct connection', {
+          fetchSocksError: fetchSocksError.message,
+          socksError: socksError.message
+        });
+        // 如果代理创建失败，返回空配置（直连）
+        return {};
+      }
+    }
+  }
+
+  /**
    * 健康检查单个节点
+   * 通过sing-box代理进行真实的节点连通性测试
    * @param {string} nodeTag - 节点标签
-   * @param {number} timeout - 超时时间（毫秒），默认5秒
+   * @param {number} timeout - 超时时间（毫秒），默认8秒
    * @returns {Promise<boolean>} 节点是否健康
    */
-  async healthCheck(nodeTag, timeout = 5000) {
+  async healthCheck(nodeTag, timeout = 8000) {
+    const startTime = Date.now();
+
     try {
+      this.logger.debug(`Starting health check for node ${nodeTag} via proxy`);
+
+      // 1. 首先切换主选择器到指定节点（用于健康检查）
+      const switchSuccess = await this.commandSwitchNode(this.config.SINGBOX_SELECTOR_NAME, nodeTag);
+      if (!switchSuccess) {
+        this.logger.debug(`Health check failed: unable to switch to node ${nodeTag}`);
+        return false;
+      }
+
+      // 2. 通过sing-box代理进行健康检查
+      const proxyAgent = this.createHealthCheckProxyAgent();
+      const testUrls = [
+        'http://www.gstatic.com/generate_204',  // Google 204检查
+        'https://httpbin.org/status/200'        // 备用检查
+      ];
+
+      let healthyCount = 0;
       const abortController = new AbortController();
       const timeoutId = setTimeout(() => abortController.abort(), timeout);
 
-      const response = await fetch('http://www.gstatic.com/generate_204', {
-        method: 'GET',
-        signal: abortController.signal,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      try {
+        // 测试多个URL，提高检查准确性
+        for (const testUrl of testUrls) {
+          try {
+            const response = await fetch(testUrl, {
+              method: 'GET',
+              signal: abortController.signal,
+              ...proxyAgent,
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': '*/*',
+                'Cache-Control': 'no-cache'
+              }
+            });
+
+            // 检查响应状态
+            const isUrlHealthy = (testUrl.includes('generate_204') && response.status === 204) ||
+                               (testUrl.includes('status/200') && response.status === 200);
+
+            if (isUrlHealthy) {
+              healthyCount++;
+              this.logger.debug(`Health check URL success: ${testUrl} (${response.status})`);
+            } else {
+              this.logger.debug(`Health check URL failed: ${testUrl} (${response.status})`);
+            }
+
+          } catch (urlError) {
+            this.logger.debug(`Health check URL error: ${testUrl} - ${urlError.message}`);
+          }
         }
-      });
 
-      clearTimeout(timeoutId);
+      } finally {
+        clearTimeout(timeoutId);
+      }
 
-      // gstatic.com/generate_204 应该返回 204 No Content
-      const isHealthy = response.status === 204;
+      // 至少一个URL测试成功才认为节点健康
+      const isHealthy = healthyCount > 0;
+      const duration = Date.now() - startTime;
 
-      this.logger.debug(`Health check for node ${nodeTag}`, {
+      this.logger.debug(`Health check completed for node ${nodeTag}`, {
         nodeTag,
-        status: response.status,
         healthy: isHealthy,
-        duration: Date.now() - (Date.now() - timeout)
+        healthyUrls: healthyCount,
+        totalUrls: testUrls.length,
+        duration,
+        method: 'via-proxy'
       });
 
       return isHealthy;
 
     } catch (error) {
+      const duration = Date.now() - startTime;
+
       this.logger.debug(`Health check failed for node ${nodeTag}`, {
         nodeTag,
         error: error.message,
-        healthy: false
+        healthy: false,
+        duration,
+        method: 'via-proxy'
       });
+
       return false;
     }
   }
+
+
 
   /**
    * 获取下一个健康节点（轮询）
@@ -342,17 +433,27 @@ class WorkerPoolController extends IProxyProvider {
       this.logger.debug(`[LAZY CHECK] Testing node ${candidateNode} (attempt ${attempt + 1}/${maxAttempts})`);
 
       // 懒加载健康检查
-      const isHealthy = await this.healthCheck(candidateNode);
+      let isHealthy = false;
+
+      try {
+        // 通过代理进行健康检查
+        isHealthy = await this.healthCheck(candidateNode);
+      } catch (healthCheckError) {
+        this.logger.warn(`[LAZY CHECK] Health check error for ${candidateNode}`, {
+          error: healthCheckError.message
+        });
+        isHealthy = false;
+      }
 
       if (isHealthy) {
         // 节点健康，使用此节点
         nodeTagToUse = candidateNode;
-        this.logger.debug(`[LAZY CHECK] Node ${candidateNode} passed health check`);
+        this.logger.debug(`[LAZY CHECK] Node ${candidateNode} passed proxy health check`);
         break;
       } else {
         // 节点不健康，移入隔离池
         this.logger.warn(`[LAZY CHECK] Node ${candidateNode} failed health check, moving to quarantine`);
-        this.moveNodeToQuarantine(candidateNode, 'Lazy health check failed');
+        this.moveNodeToQuarantine(candidateNode, 'Lazy health check failed via proxy');
       }
     }
 
@@ -456,7 +557,7 @@ class WorkerPoolController extends IProxyProvider {
       contextLogger.logError(error, 'worker-node-switch', {
         selector: selectorName,
         targetNode: nodeTag,
-        originalTargetNode: this.findOriginalNodeName(nodeTag)
+        originalTargetNode: nodeTag  // 直接使用nodeTag，因为它已经是正确的节点名称
       });
 
       this.logger.error(`Failed to switch worker selector ${selectorName} to node ${nodeTag}`, error);
